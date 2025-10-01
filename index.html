@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Disaster Sim — First Person (Three.js)</title>
+  <style>
+    html,body{height:100%;margin:0;font-family:Inter,system-ui,Arial}
+    #overlay{
+      position:fixed;left:12px;top:12px;color:#fff;padding:10px 14px;background:rgba(0,0,0,0.45);border-radius:8px;backdrop-filter:blur(4px);
+      max-width:320px;font-size:14px;line-height:1.4
+    }
+    #hud{position:fixed;right:12px;top:12px;color:#fff;padding:10px 14px;background:rgba(0,0,0,0.35);border-radius:8px}
+    #startBtn{display:inline-block;margin-top:8px;padding:8px 12px;background:#0ea5e9;border:none;border-radius:6px;color:#042;cursor:pointer}
+    canvas{display:block}
+    #message{position:fixed;left:50%;top:40%;transform:translate(-50%,-50%);color:#fff;padding:18px 22px;background:rgba(0,0,0,0.6);border-radius:10px;display:none}
+  </style>
+</head>
+<body>
+  <div id="overlay">
+    <strong>Disaster Sim — Earthquake (Prototype)</strong>
+    <div style="margin-top:8px">Objective: Reach the safe zone (green area) while following correct actions. Use <em>W A S D</em> to move, <em>mouse</em> to look. Click <strong>Start</strong> to lock pointer.</div>
+    <button id="startBtn">Start Simulation</button>
+    <div style="margin-top:8px;font-size:12px;opacity:0.9">Tip: When shaking begins, press <strong>Space</strong> to <em>Drop, Cover & Hold</em>. Doing so reduces penalty.</div>
+  </div>
+  <div id="hud">Score: <span id="score">0</span></div>
+  <div id="message"></div>
+
+  <!-- Three.js core only (examples removed). We implement a small, self-contained PointerLockControls replacement. -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.155.0/build/three.min.js"></script>
+  <script>
+  // --- Simple First-Person 3D Disaster Simulation (Three.js) ---
+  // Fixed: removed dependency on examples/PointerLockControls which sometimes doesn't export THREE.PointerLockControls
+  // Instead we implement a small compatible PointerLockControls-like class (SimplePointerLockControls)
+
+  // --- SimplePointerLockControls implementation ---
+  function SimplePointerLockControls(camera, domElement){
+    this.domElement = (domElement !== undefined) ? domElement : document.body;
+    this.camera = camera;
+
+    // internal objects to handle yaw (left/right) and pitch (up/down)
+    this.yawObject = new THREE.Object3D();
+    this.pitchObject = new THREE.Object3D();
+
+    this.pitchObject.add(this.camera);
+    this.yawObject.add(this.pitchObject);
+
+    // place player so camera world position = (0, 1.6, 5) by default
+    this.yawObject.position.set(0, 0, 5);
+    this.camera.position.set(0, 1.6, 0);
+
+    this.isLocked = false;
+
+    // simple event system
+    this._listeners = { 'lock': [], 'unlock': [] };
+    this.addEventListener = function(type, cb){ if(this._listeners[type]) this._listeners[type].push(cb); };
+    this.dispatchEvent = function(event){ const listeners = this._listeners[event.type] || []; for(const l of listeners) l(event); };
+
+    const scope = this;
+
+    // Pointer lock change handler
+    function onPointerlockChange(){
+      const locked = (document.pointerLockElement === scope.domElement);
+      scope.isLocked = locked;
+      scope.dispatchEvent({ type: locked ? 'lock' : 'unlock' });
+    }
+
+    function onPointerlockError(){ console.warn('PointerLockControls: Unable to use Pointer Lock API'); }
+
+    document.addEventListener('pointerlockchange', onPointerlockChange);
+    document.addEventListener('pointerlockerror', onPointerlockError);
+
+    // mouse movement handler
+    function onMouseMove(event){
+      if(scope.isLocked === false) return;
+      const movementX = event.movementX || event.mozMovementX || event.webkitMovementX || 0;
+      const movementY = event.movementY || event.mozMovementY || event.webkitMovementY || 0;
+
+      const PI_2 = Math.PI / 2;
+      scope.yawObject.rotation.y -= movementX * 0.002;
+      scope.pitchObject.rotation.x -= movementY * 0.002;
+      // clamp pitch
+      scope.pitchObject.rotation.x = Math.max(-PI_2, Math.min(PI_2, scope.pitchObject.rotation.x));
+    }
+
+    document.addEventListener('mousemove', onMouseMove);
+
+    // API methods similar to Three.js PointerLockControls
+    this.lock = function(){
+      try{ this.domElement.requestPointerLock(); } catch(e){ console.warn('Pointer lock request failed', e); }
+    };
+    this.unlock = function(){ try{ document.exitPointerLock(); } catch(e){ console.warn('Pointer lock exit failed', e); } };
+
+    this.getObject = function(){ return this.yawObject; };
+    this.moveForward = function(distance){
+      // translateZ moves the object forward in its local z-axis
+      this.yawObject.translateZ(distance);
+    };
+    this.moveRight = function(distance){
+      this.yawObject.translateX(distance);
+    };
+  }
+
+  // --- Simulation script (main) ---
+  let scene, camera, renderer, controls;
+  let objects = [];
+  let velocity = new THREE.Vector3();
+  let direction = new THREE.Vector3();
+  const move = { forward:false, backward:false, left:false, right:false };
+  let score = 0;
+  let shaking = false;
+  let covered = false; // player performed Drop/Cover
+
+  const startBtn = document.getElementById('startBtn');
+  const scoreEl = document.getElementById('score');
+  const messageEl = document.getElementById('message');
+
+  init();
+  animate();
+
+  function init(){
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x87ceeb);
+
+    camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 1000);
+
+    renderer = new THREE.WebGLRenderer({antialias:true});
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    // Lighting
+    const hemi = new THREE.HemisphereLight(0xffffff,0x444444,1.2);
+    hemi.position.set(0,20,0);
+    scene.add(hemi);
+    const dir = new THREE.DirectionalLight(0xffffff,0.6);
+    dir.position.set(-3,10,-10);
+    scene.add(dir);
+
+    // Floor
+    const floorG = new THREE.PlaneGeometry(60,60);
+    const floorM = new THREE.MeshStandardMaterial({color:0x666666});
+    const floor = new THREE.Mesh(floorG,floorM);
+    floor.rotation.x = -Math.PI/2;
+    floor.receiveShadow = true;
+    scene.add(floor);
+
+    // Simple building blocks (classroom walls)
+    addBox({x:0,y:1.5,z:-10, sx:20, sy:3, sz:0.4, color:0x8b8b8b});
+    addBox({x:-10,y:1.5,z:0, sx:0.4, sy:3, sz:20, color:0x8b8b8b});
+    addBox({x:10,y:1.5,z:0, sx:0.4, sy:3, sz:20, color:0x8b8b8b});
+
+    // Desks (obstacles)
+    for(let i=-2;i<=2;i++){
+      addBox({x:i*2, y:0.6, z:-6, sx:1.6, sy:1.2, sz:1, color:0x8b5a2b});
+    }
+
+    // Hazard zone (red)
+    const hazard = addBox({x:6, y:0.01, z:-2, sx:4, sy:0.02, sz:4, color:0xff4444});
+    hazard.userData = { hazard:true };
+
+    // Safe zone (green)
+    const safeZone = addBox({x:-18, y:0.01, z:14, sx:6, sy:0.02, sz:6, color:0x4caf50});
+    safeZone.userData = { safe:true };
+
+    // A couple of NPC (blocks representing injured person)
+    const npc1 = addBox({x:-4, y:0.5, z:0, sx:0.8, sy:1, sz:0.8, color:0xffd54f});
+    npc1.userData = { helpNeeded:true };
+
+    // Use our SimplePointerLockControls
+    controls = new SimplePointerLockControls(camera, renderer.domElement);
+
+    // add the player object to the scene
+    scene.add(controls.getObject());
+
+    startBtn.addEventListener('click', ()=>{
+      controls.lock();
+      startBtn.style.display='none';
+      showMessage('Simulation started. Wait for quake...');
+      setTimeout(()=>{ startEarthquake(); }, 3500);
+    });
+
+    controls.addEventListener('lock', ()=>{ console.log('pointer locked'); });
+    controls.addEventListener('unlock', ()=>{ startBtn.style.display='inline-block'; });
+
+    // Movement keys
+    document.addEventListener('keydown', onKeyDown);
+    document.addEventListener('keyup', onKeyUp);
+    window.addEventListener('resize', onWindowResize);
+
+    // Space -> Drop/Cover
+    document.addEventListener('keydown', (e)=>{ if(e.code==='Space'){ if(shaking){ covered=true; showMessage('You performed Drop, Cover & Hold — reduced damage'); setTimeout(()=>hideMessage(),1500);} } });
+
+  }
+
+  function addBox({x=0,y=0,z=0,sx=1,sy=1,sz=1,color=0xffffff}){
+    const g = new THREE.BoxGeometry(sx,sy,sz);
+    const m = new THREE.MeshStandardMaterial({color});
+    const mesh = new THREE.Mesh(g,m);
+    mesh.position.set(x,y,z);
+    scene.add(mesh);
+    objects.push(mesh);
+    return mesh;
+  }
+
+  function onWindowResize(){
+    camera.aspect = window.innerWidth/window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  }
+
+  function onKeyDown(e){
+    switch(e.code){
+      case 'ArrowUp':
+      case 'KeyW': move.forward=true; break;
+      case 'ArrowLeft':
+      case 'KeyA': move.left=true; break;
+      case 'ArrowDown':
+      case 'KeyS': move.backward=true; break;
+      case 'ArrowRight':
+      case 'KeyD': move.right=true; break;
+    }
+  }
+  function onKeyUp(e){
+    switch(e.code){
+      case 'ArrowUp':
+      case 'KeyW': move.forward=false; break;
+      case 'ArrowLeft':
+      case 'KeyA': move.left=false; break;
+      case 'ArrowDown':
+      case 'KeyS': move.backward=false; break;
+      case 'ArrowRight':
+      case 'KeyD': move.right=false; break;
+    }
+  }
+
+  let prevTime = performance.now();
+  function animate(){
+    requestAnimationFrame(animate);
+    const time = performance.now();
+    const delta = (time - prevTime) / 1000;
+
+    if(controls.isLocked === true){
+      // Movement physics
+      velocity.x -= velocity.x * 10.0 * delta;
+      velocity.z -= velocity.z * 10.0 * delta;
+
+      direction.z = Number(move.forward) - Number(move.backward);
+      direction.x = Number(move.right) - Number(move.left);
+      direction.normalize();
+
+      const speed = covered ? 1.2 : 4.0; // covered -> slightly slower
+      if(direction.length()>0){
+        velocity.x -= direction.x * speed * delta;
+        velocity.z -= direction.z * speed * delta;
+      }
+
+      // Note: original code used negative signs when calling moveRight/moveForward.
+      // We'll keep the same sign convention to preserve movement feel.
+      controls.moveRight(-velocity.x * delta);
+      controls.moveForward(-velocity.z * delta);
+
+      // keep player above floor
+      const pos = controls.getObject().position;
+      pos.y = 0; // the camera's height is handled by the camera child (camera.position.y = 1.6)
+
+      checkInteractions();
+    }
+
+    // simple quake screen shake effect when shaking
+    if(shaking){
+      const shakeAmount = covered ? 0.02 : 0.08; // less if covered
+      // apply shake to camera locally (not to yawObject) for visible effect
+      camera.position.x += (Math.random()-0.5)*shakeAmount;
+      camera.position.y += (Math.random()-0.5)*shakeAmount;
+      camera.position.z += (Math.random()-0.5)*shakeAmount;
+    }
+
+    renderer.render(scene,camera);
+    prevTime = time;
+  }
+
+  function startEarthquake(){
+    showMessage('Earthquake! Drop, Cover & Hold (press Space).');
+    shaking = true; covered=false;
+    // quake lasts 8 seconds
+    setTimeout(()=>{ endEarthquake(); }, 8000);
+  }
+  function endEarthquake(){
+    shaking = false;
+    hideMessage();
+    assessDamage();
+  }
+
+  function assessDamage(){
+    // if player didn't cover, penalty
+    if(!covered){
+      score -= 20;
+      updateScore();
+      showMessage('You didn\'t perform Drop/Cover — you took damage. -20 pts');
+      setTimeout(()=>hideMessage(),2000);
+    } else {
+      score += 10; updateScore();
+      showMessage('Good — you protected yourself. +10 pts');
+      setTimeout(()=>hideMessage(),1600);
+    }
+  }
+
+  function checkInteractions(){
+    const playerPos = controls.getObject().position;
+
+    // Check with objects for simple proximity interactions
+    for(const obj of objects){
+      const d = obj.position.distanceTo(playerPos);
+      if(d < 1.5){
+        if(obj.userData && obj.userData.hazard){
+          // hazard penalty
+          score -= 5; updateScore();
+          showMessage('You entered a hazard area — avoid danger zones! -5 pts');
+          // push player back
+          const back = new THREE.Vector3().subVectors(playerPos, obj.position).setY(0).normalize().multiplyScalar(1.5);
+          controls.getObject().position.add(back);
+          setTimeout(()=>hideMessage(),1600);
+        }
+        if(obj.userData && obj.userData.safe){
+          // reached safe zone -> win
+          score += 50; updateScore();
+          showMessage('You reached the safe zone — well done! +50 pts');
+          controls.unlock();
+          setTimeout(()=>{ showMessage('Simulation complete — refresh to play again'); },1800);
+        }
+        if(obj.userData && obj.userData.helpNeeded){
+          // help NPC
+          score += 15; updateScore();
+          showMessage('You helped a vulnerable person — teamwork bonus +15');
+          obj.userData.helpNeeded=false;
+          obj.material.color.set(0x4caf50); // mark helped
+          setTimeout(()=>hideMessage(),1600);
+        }
+      }
+    }
+  }
+
+  function updateScore(){ scoreEl.textContent = Math.max(0, score); }
+
+  function showMessage(txt){ messageEl.style.display='block'; messageEl.textContent = txt; }
+  function hideMessage(){ messageEl.style.display='none'; messageEl.textContent = ''; }
+
+  </script>
+</body>
+</html>
